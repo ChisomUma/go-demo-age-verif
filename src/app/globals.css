@@ -1,0 +1,45 @@
+@import url("https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=Instrument+Sans:wght@400;500;600;700&display=swap");
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    @apply bg-slate-50 text-slate-900 antialiased;
+  }
+}
+
+@layer components {
+  .input-field {
+    @apply block w-full rounded-lg border border-slate-300 bg-white px-4 py-3
+           text-sm text-slate-900 shadow-sm transition-all duration-200
+           placeholder:text-slate-400
+           hover:border-slate-400
+           focus:border-gbg-500 focus:ring-2 focus:ring-gbg-500/20 focus:outline-none;
+  }
+
+  .input-label {
+    @apply mb-1.5 block text-sm font-medium text-slate-700;
+  }
+
+  .input-error {
+    @apply mt-1 text-xs text-red-600;
+  }
+
+  .btn-primary {
+    @apply inline-flex items-center justify-center gap-2 rounded-lg bg-gbg-700 px-6 py-3
+           text-sm font-semibold text-white shadow-sm transition-all duration-200
+           hover:bg-gbg-800 hover:shadow-md
+           focus:ring-2 focus:ring-gbg-500/40 focus:ring-offset-2 focus:outline-none
+           disabled:cursor-not-allowed disabled:opacity-50;
+  }
+
+  .btn-secondary {
+    @apply inline-flex items-center justify-center gap-2 rounded-lg border border-slate-300
+           bg-white px-6 py-3 text-sm font-semibold text-slate-700 shadow-sm
+           transition-all duration-200
+           hover:bg-slate-50 hover:border-slate-400
+           focus:ring-2 focus:ring-slate-500/20 focus:ring-offset-2 focus:outline-none;
+  }
+}
