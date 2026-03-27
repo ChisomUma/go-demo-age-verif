@@ -47,8 +47,11 @@ async function request<T>(url: string, body?: unknown): Promise<T> {
 // ─── Public API ──────────────────────────────────────────────────────────────
 
 /** Starts a new journey and returns the instanceId. */
-export async function startJourney(resourceId: string) {
-  return request<JourneyStartResponse>("/api/journey/start", { resourceId });
+export async function startJourney(resourceId: string, documentImage?: string) {
+  return request<JourneyStartResponse>("/api/journey/start", {
+    resourceId,
+    ...(documentImage ? { documentImage } : {}),
+  });
 }
 
 /** Fetches the current interaction (pages, cards, outstanding elements). */

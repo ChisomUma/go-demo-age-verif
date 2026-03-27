@@ -23,6 +23,7 @@ export async function POST(req: NextRequest) {
     );
 
     const data = await res.json();
+    console.log("[journey/state] GBG response:", res.status, JSON.stringify(data).substring(0, 500));
     if (!res.ok) {
       return NextResponse.json(data, { status: res.status });
     }

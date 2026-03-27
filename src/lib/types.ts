@@ -61,7 +61,7 @@ export interface SubmitPayload {
   interactionId: string;
   participants: { domainElementId: string }[];
   context: {
-    subject: SubjectData;
+    subject: Record<string, unknown>;
   };
 }
 

@@ -302,8 +302,16 @@ import { getCustomerToken } from "../../auth/token";
 
 export async function POST(req: NextRequest) {
   try {
-    const { resourceId } = await req.json();
+    const { resourceId, documentImage } = await req.json();
     const token = await getCustomerToken();
+
+    // Build subject context — include document if provided (prefill mode)
+    const subject: Record<string, unknown> = {};
+    if (documentImage) {
+      // Strip data URI prefix to get raw base64
+      const raw = documentImage.replace(/^data:[^;]+;base64,/, "");
+      subject.documents = [{ side1Image: raw }];
+    }
 
     const res = await fetch(
       `${process.env.GBG_API_BASE_URL}/journey/start`,
@@ -317,7 +325,7 @@ export async function POST(req: NextRequest) {
           resourceId,
           context: {
             config: { delivery: "api" },
-            subject: {},
+            subject,
           },
         }),
         cache: "no-store",
@@ -350,10 +358,11 @@ export async function POST(req: NextRequest) {
 }
 ```
 
-There are two things to note in the request body:
+There are three things to note in the request body:
 
 * **`resourceId`**: The journey hash and version you copied from the Journey Builder dashboard, for example `abc123...@latest`.
-* **`context.config.delivery: "api"`**: This tells GBG you are consuming the journey via the API rather than a hosted web flow. The `subject` object is left empty because data is collected through interactions.
+* **`context.config.delivery: "api"`**: This tells GBG you are consuming the journey via the API rather than a hosted web flow.
+* **`context.subject.documents`** (optional): When a `documentImage` is provided, it is included as a prefilled document using the `side1Image` field. This is used later in the submit flow — the document is uploaded at journey start time so the platform can begin processing it early.
 
 The response returns an `instanceId` — a unique identifier for this journey session that is used in all subsequent API calls.
 
@@ -427,8 +436,24 @@ import { getCustomerToken } from "../../auth/token";
 
 export async function POST(req: NextRequest) {
   try {
-    const payload = await req.json();
+    const body = await req.json();
     const token = await getCustomerToken();
+
+    // Extract private document image field from client
+    const docImage: string | undefined = body._documentImage;
+    delete body._documentImage;
+
+    // If document image provided, add it in the correct GBG format
+    if (docImage) {
+      const rawBase64 = docImage.replace(/^data:[^;]+;base64,/, "");
+      body.context.subject.documents = [
+        {
+          side1Image: rawBase64,
+          side2Image: "",
+          type: "Primary",
+        },
+      ];
+    }
 
     const res = await fetch(
       `${process.env.GBG_API_BASE_URL}/journey/interaction/submit`,
@@ -438,12 +463,22 @@ export async function POST(req: NextRequest) {
           Authorization: `Bearer ${token}`,
           "Content-Type": "application/json",
         },
-        body: JSON.stringify(payload),
+        body: JSON.stringify(body),
         cache: "no-store",
       },
     );
 
-    const data = await res.json();
+    const text = await res.text();
+
+    let data: unknown;
+    try {
+      data = JSON.parse(text);
+    } catch {
+      return NextResponse.json(
+        { error: `GBG returned non-JSON (${res.status}): ${text.slice(0, 500)}` },
+        { status: 502 },
+      );
+    }
 
     if (!res.ok) {
       return NextResponse.json(data, { status: res.status });
@@ -459,11 +494,15 @@ export async function POST(req: NextRequest) {
 }
 ```
 
-This route forwards the complete submission payload to the GBG `journey/interaction/submit` endpoint. The payload contains three key parts, which are assembled by the `VerificationForm` component:
+This route handles the complete submission payload and forwards it to the GBG `journey/interaction/submit` endpoint. There are two important things this route does:
+
+**Document handling**: The frontend sends the document image as a private `_documentImage` field. The route strips this field from the payload and reformats it into the structure the GBG API expects: `context.subject.documents[]` with `side1Image` (the base64 image), `side2Image` (empty string), and `type` set to `"Primary"`. This separation keeps the frontend simple while ensuring the API receives the correct format.
+
+**Payload forwarding**: The remaining payload contains three parts assembled by the `VerificationForm` component:
 
 * **`instanceId`** and **`interactionId`**: Identifies which journey instance and interaction this submission belongs to.
-* **`participants`**: An array of domain element IDs that were collected, for example `[{ domainElementId: "FullName" }, { domainElementId: "DateOfBirth" }]`. This tells the API which elements you are providing data for.
-* **`context.subject`**: The structured identity data built by `buildSubjectPayload` — names, date of birth, address, phone, email, and document data in the format the API expects.
+* **`participants`**: An array of domain element IDs that were collected, for example `[{ domainElementId: "FullName" }, { domainElementId: "PrimaryDocument" }]`. This tells the API which elements you are providing data for.
+* **`context.subject`**: The structured identity data — names, date of birth, address, phone, and email fields in the format the API expects.
 
 ## Fetch journey results
 

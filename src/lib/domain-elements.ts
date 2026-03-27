@@ -224,12 +224,9 @@ const DOMAIN_ELEMENTS: DomainElementDef[] = [
         hint: "Upload a clear photo or scan of your document.",
       },
     ],
-    toSubject: (v: FormValues) => ({
-      primaryDocument: {
-        type: v.documentType,
-        image: v.documentImage, // base64 data URI
-      },
-    }),
+    // PrimaryDocument is handled via prefill at journey start, not via
+    // interaction submit. Return empty — the image is sent separately.
+    toSubject: () => ({}),
   },
 ];
 

@@ -1,4 +1,4 @@
-import type { FormValues, SubjectData } from "./types";
+import type { FormValues } from "./types";
 import { getDomainElement, resolveDomainElementIds } from "./domain-elements";
 
 /**
@@ -9,18 +9,18 @@ import { getDomainElement, resolveDomainElementIds } from "./domain-elements";
 export function buildSubjectPayload(
   formValues: FormValues,
   domainElementIds: string[],
-): SubjectData {
-  const subject: SubjectData = { identity: {} };
+): Record<string, unknown> {
+  const identity: Record<string, unknown> = {};
 
   for (const id of domainElementIds) {
     const def = getDomainElement(id);
     if (!def) continue;
 
     const partial = def.toSubject(formValues);
-    Object.assign(subject.identity, partial);
+    Object.assign(identity, partial);
   }
 
-  return subject;
+  return { identity };
 }
 
 /**
