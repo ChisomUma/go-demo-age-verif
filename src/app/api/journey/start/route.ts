@@ -25,8 +25,18 @@ export async function POST(req: NextRequest) {
       },
     );
 
-    const data = await res.json();
-    console.log("[journey/start] GBG response:", res.status, JSON.stringify(data, null, 2));
+    const text = await res.text();
+    console.log("[journey/start] GBG response:", res.status, text);
+
+    let data: unknown;
+    try {
+      data = JSON.parse(text);
+    } catch {
+      return NextResponse.json(
+        { error: `GBG returned non-JSON (${res.status}): ${text.slice(0, 200)}` },
+        { status: 502 },
+      );
+    }
 
     if (!res.ok) {
       return NextResponse.json(data, { status: res.status });

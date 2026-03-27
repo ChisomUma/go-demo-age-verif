@@ -1,0 +1,1561 @@
+# Build an identity verification app with GBG GO APIs — Part 2: Build the frontend
+
+> Build a dynamic, multi-step form that renders itself from GBG GO interaction data.
+
+This is Part 2 of the tutorial. If you haven't completed the backend setup, start with [Part 1: Setup and API routes](/tutorial-part1).
+
+The frontend is built from four components and three library modules. Each has a specific role in the dynamic form architecture.
+
+## TypeScript types
+
+Create `src/lib/types.ts` to define the interfaces used across the app. These types model the GBG API responses and the dynamic form system:
+
+```typescript typescript expandable theme={null}
+// src/lib/types.ts
+
+// ─── Interaction Fetch Response ─────────────────────────────────────────────
+
+export interface InteractionCard {
+  id: string;
+  config?: {
+    secrets?: Record<string, { value: string }>;
+  };
+}
+
+export interface InteractionPage {
+  id: string;
+  label: string;
+  cards: InteractionCard[];
+}
+
+export interface InteractionResource {
+  id: string;
+  name: string;
+  version: string;
+  type: string;
+  data: {
+    pages: InteractionPage[];
+  };
+}
+
+export interface CollectsItem {
+  ref: string;
+  spec: "required" | "optional";
+}
+
+export interface InteractionDetail {
+  grId: string;
+  resource: InteractionResource;
+  collects: CollectsItem[];
+  consumes: CollectsItem[];
+}
+
+export interface InteractionFetchResponse {
+  instanceId: string;
+  interactionId: string;
+  journey: {
+    status: "InProgress" | "Completed" | "Failed";
+  };
+  interaction: InteractionDetail;
+  outstanding: string[];
+}
+
+// ─── Journey Start ──────────────────────────────────────────────────────────
+
+export interface JourneyStartResponse {
+  instanceId: string;
+  instanceUrl?: string;
+  status?: string;
+  message?: string;
+}
+
+// ─── Interaction Submit ─────────────────────────────────────────────────────
+
+export interface SubmitPayload {
+  instanceId: string;
+  interactionId: string;
+  participants: { domainElementId: string }[];
+  context: {
+    subject: SubjectData;
+  };
+}
+
+export interface SubjectData {
+  identity: {
+    firstName?: string;
+    middleNames?: string[];
+    lastNames?: string[];
+    dateOfBirth?: string;
+    currentAddress?: AddressData;
+    phones?: { type: string; number: string }[];
+    emails?: { type: string; email: string }[];
+    [key: string]: unknown;
+  };
+}
+
+export interface AddressData {
+  lines: string[];
+  locality: string;
+  dependentLocality?: string;
+  postalCode: string;
+  country: string;
+}
+
+// ─── Journey State ──────────────────────────────────────────────────────────
+
+export interface JourneyStateResponse {
+  instanceId: string;
+  status: "InProgress" | "Completed" | "Failed";
+  metaData?: {
+    createdTime: string;
+    completedTime?: string;
+  };
+  context?: Record<string, unknown>;
+  data?: Record<string, unknown>;
+}
+
+// ─── Dynamic Form State ────────────────────────────────────────────────────
+
+/** All form values stored as a flat string map keyed by field ID. */
+export type FormValues = Record<string, string>;
+
+// ─── Dynamic Field Definitions ─────────────────────────────────────────────
+
+export interface FieldDef {
+  id: string;
+  label: string;
+  type: "text" | "email" | "tel" | "date" | "select" | "file";
+  placeholder?: string;
+  autoComplete?: string;
+  options?: { value: string; label: string }[];
+  accept?: string;
+  colSpan?: 1 | 2;
+  hint?: string;
+  alwaysOptional?: boolean;
+  validate?: (value: string) => string | null;
+}
+
+/** Defines the fields a domain element collects and how to map them to the API payload. */
+export interface DomainElementDef {
+  id: string;
+  fields: FieldDef[];
+  requiredFields: string[];
+  toSubject: (values: FormValues) => Partial<SubjectData["identity"]>;
+}
+```
+
+The key types to understand are:
+
+* **`InteractionFetchResponse`**: The full response from the fetch interaction endpoint, containing pages, cards, and collection requirements.
+* **`DomainElementDef`**: Defines a domain element's form fields, which are required, and how to transform the collected values into the API submission payload. This is the core of the dynamic form system.
+* **`FormValues`**: A flat `Record<string, string>` that stores all form field values keyed by field ID — simple and efficient for dynamic forms.
+
+## Client-side API layer
+
+Create `src/lib/api.ts` to provide typed functions that the frontend components call. These functions POST to the Next.js API routes you created in Part 1:
+
+```typescript typescript expandable theme={null}
+// src/lib/api.ts
+import type {
+  InteractionFetchResponse,
+  JourneyStartResponse,
+  JourneyStateResponse,
+  SubmitPayload,
+} from "./types";
+
+class ApiError extends Error {
+  constructor(
+    message: string,
+    public status: number,
+    public body?: unknown,
+  ) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
+
+async function request<T>(url: string, body?: unknown): Promise<T> {
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+
+  let data: unknown;
+  try {
+    data = await res.json();
+  } catch {
+    throw new ApiError(
+      `Server returned ${res.status} with non-JSON response`,
+      res.status,
+    );
+  }
+
+  if (!res.ok) {
+    const msg =
+      (data as Record<string, string>)?.message ??
+      (data as Record<string, string>)?.error ??
+      "Request failed";
+    throw new ApiError(msg, res.status, data);
+  }
+
+  return data as T;
+}
+
+// ─── Public API ─────────────────────────────────────────────────────────────
+
+/** Starts a new journey and returns the instanceId. */
+export async function startJourney(resourceId: string) {
+  return request<JourneyStartResponse>("/api/journey/start", { resourceId });
+}
+
+/** Fetches the current interaction (pages, cards, outstanding elements). */
+export async function fetchInteraction(instanceId: string) {
+  return request<InteractionFetchResponse>("/api/journey/fetch", {
+    instanceId,
+  });
+}
+
+/** Submits collected domain element data for the current interaction. */
+export async function submitInteraction(payload: SubmitPayload) {
+  return request<{ status: string }>("/api/journey/submit", payload);
+}
+
+/** Fetches journey state (status, results). */
+export async function fetchJourneyState(instanceId: string) {
+  return request<JourneyStateResponse>("/api/journey/state", { instanceId });
+}
+
+/**
+ * Polls interaction/fetch until an interaction appears or journey completes.
+ * Uses 3-second intervals with a 60-second timeout.
+ */
+export async function pollForInteraction(
+  instanceId: string,
+  signal?: AbortSignal,
+): Promise<InteractionFetchResponse> {
+  const POLL_INTERVAL = 3000;
+  const TIMEOUT = 60_000;
+  const start = Date.now();
+
+  while (Date.now() - start < TIMEOUT) {
+    if (signal?.aborted) throw new Error("Polling aborted");
+
+    try {
+      const response = await fetchInteraction(instanceId);
+
+      if (response.interactionId) return response;
+      if (response.journey?.status !== "InProgress") return response;
+    } catch (err) {
+      if (err instanceof ApiError && err.status >= 500) {
+        console.warn("Server error during poll, retrying...", err.message);
+      } else {
+        throw err;
+      }
+    }
+
+    await new Promise((r) => setTimeout(r, POLL_INTERVAL));
+  }
+
+  throw new Error("Polling timed out waiting for interaction");
+}
+```
+
+The `request` helper standardises error handling across all API calls. The `pollForInteraction` function is particularly important — after starting a journey, the GBG platform may take a few seconds to prepare the interaction. This function retries every 3 seconds for up to 60 seconds, tolerating transient 5xx errors during the startup window.
+
+## Domain element registry
+
+The domain element registry is the heart of the dynamic form system. It defines what fields each card collects and how to map those values to the GBG API payload.
+
+Create `src/lib/domain-elements.ts`:
+
+```typescript typescript expandable theme={null}
+// src/lib/domain-elements.ts
+import type { DomainElementDef, FormValues } from "./types";
+
+const COUNTRIES = [
+  { value: "GB", label: "United Kingdom" },
+  { value: "US", label: "United States" },
+  { value: "AU", label: "Australia" },
+  { value: "CA", label: "Canada" },
+  { value: "DE", label: "Germany" },
+  { value: "FR", label: "France" },
+  { value: "NG", label: "Nigeria" },
+  { value: "IN", label: "India" },
+  { value: "ZA", label: "South Africa" },
+  { value: "IE", label: "Ireland" },
+];
+
+/**
+ * Registry of all known domain elements.
+ *
+ * Each entry defines:
+ * - The form fields the element collects
+ * - Which fields are required when the element is marked "required"
+ * - How to map field values into the canonical subject payload
+ *
+ * To support a new domain element, add an entry here — no other
+ * component changes needed.
+ */
+const DOMAIN_ELEMENTS: DomainElementDef[] = [
+  {
+    id: "FullName",
+    requiredFields: ["firstName", "lastNames"],
+    fields: [
+      {
+        id: "firstName",
+        label: "First name",
+        type: "text",
+        placeholder: "Jane",
+        autoComplete: "given-name",
+      },
+      {
+        id: "middleNames",
+        label: "Middle name(s)",
+        type: "text",
+        placeholder: "Marie",
+        autoComplete: "additional-name",
+        alwaysOptional: true,
+        hint: "Separate multiple middle names with commas.",
+      },
+      {
+        id: "lastNames",
+        label: "Last name(s)",
+        type: "text",
+        placeholder: "Doe",
+        autoComplete: "family-name",
+        hint: "Separate multiple last names with commas.",
+      },
+    ],
+    toSubject: (v: FormValues) => ({
+      firstName: v.firstName?.trim(),
+      lastNames: v.lastNames
+        ?.split(",")
+        .map((n) => n.trim())
+        .filter(Boolean),
+      ...(v.middleNames?.trim()
+        ? {
+            middleNames: v.middleNames
+              .split(",")
+              .map((n) => n.trim())
+              .filter(Boolean),
+          }
+        : {}),
+    }),
+  },
+  {
+    id: "DateOfBirth",
+    requiredFields: ["dateOfBirth"],
+    fields: [
+      {
+        id: "dateOfBirth",
+        label: "Date of birth",
+        type: "date",
+        autoComplete: "bday",
+        hint: "Format: YYYY-MM-DD",
+        validate: (value: string) => {
+          if (!value) return null;
+          const dob = new Date(value);
+          if (isNaN(dob.getTime())) return "Enter a valid date.";
+          if (dob > new Date()) return "Date of birth cannot be in the future.";
+          return null;
+        },
+      },
+    ],
+    toSubject: (v: FormValues) => ({
+      dateOfBirth: v.dateOfBirth,
+    }),
+  },
+  {
+    id: "PersonalEmail",
+    requiredFields: ["email"],
+    fields: [
+      {
+        id: "email",
+        label: "Email address",
+        type: "email",
+        placeholder: "jane.doe@example.com",
+        autoComplete: "email",
+        validate: (value: string) => {
+          if (value.trim() && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value))
+            return "Enter a valid email address.";
+          return null;
+        },
+      },
+    ],
+    toSubject: (v: FormValues) =>
+      v.email?.trim()
+        ? { emails: [{ type: "personal", email: v.email.trim() }] }
+        : {},
+  },
+  {
+    id: "MobilePhone",
+    requiredFields: ["phone"],
+    fields: [
+      {
+        id: "phone",
+        label: "Mobile phone number",
+        type: "tel",
+        placeholder: "+44 7700 900000",
+        autoComplete: "tel",
+        validate: (value: string) => {
+          if (value.trim() && value.replace(/\D/g, "").length < 7)
+            return "Enter a valid phone number.";
+          return null;
+        },
+      },
+    ],
+    toSubject: (v: FormValues) =>
+      v.phone?.trim()
+        ? { phones: [{ type: "mobile", number: v.phone.trim() }] }
+        : {},
+  },
+  {
+    id: "CurrentAddress",
+    requiredFields: ["addressLine1", "locality", "postalCode", "country"],
+    fields: [
+      {
+        id: "addressLine1",
+        label: "Address line 1",
+        type: "text",
+        placeholder: "123 High Street",
+        autoComplete: "address-line1",
+      },
+      {
+        id: "addressLine2",
+        label: "Address line 2",
+        type: "text",
+        placeholder: "Flat 2B",
+        autoComplete: "address-line2",
+        alwaysOptional: true,
+      },
+      {
+        id: "locality",
+        label: "City / Town",
+        type: "text",
+        placeholder: "London",
+        autoComplete: "address-level2",
+        colSpan: 1,
+      },
+      {
+        id: "dependentLocality",
+        label: "County / State",
+        type: "text",
+        placeholder: "Greater London",
+        autoComplete: "address-level1",
+        colSpan: 1,
+        alwaysOptional: true,
+      },
+      {
+        id: "postalCode",
+        label: "Postal code",
+        type: "text",
+        placeholder: "SW1A 1AA",
+        autoComplete: "postal-code",
+        colSpan: 1,
+      },
+      {
+        id: "country",
+        label: "Country",
+        type: "select",
+        autoComplete: "country",
+        options: COUNTRIES,
+        colSpan: 1,
+      },
+    ],
+    toSubject: (v: FormValues) => ({
+      currentAddress: {
+        lines: [v.addressLine1, v.addressLine2]
+          .map((l) => l?.trim())
+          .filter(Boolean),
+        locality: v.locality?.trim() ?? "",
+        dependentLocality: v.dependentLocality?.trim() || undefined,
+        postalCode: v.postalCode?.trim() ?? "",
+        country: v.country?.trim() ?? "",
+      },
+    }),
+  },
+  {
+    id: "PrimaryDocument",
+    requiredFields: ["documentType", "documentImage"],
+    fields: [
+      {
+        id: "documentType",
+        label: "Document type",
+        type: "select",
+        options: [
+          { value: "PASSPORT", label: "Passport" },
+          { value: "DRIVING_LICENCE", label: "Driving licence" },
+          { value: "NATIONAL_ID", label: "National ID card" },
+        ],
+      },
+      {
+        id: "documentImage",
+        label: "Upload document image",
+        type: "file",
+        accept: "image/*,.pdf",
+        hint: "Upload a clear photo or scan of your document.",
+      },
+    ],
+    toSubject: (v: FormValues) => ({
+      primaryDocument: {
+        type: v.documentType,
+        image: v.documentImage,
+      },
+    }),
+  },
+];
+
+/** Map from domain element ID to its definition. */
+const REGISTRY = new Map(DOMAIN_ELEMENTS.map((d) => [d.id, d]));
+
+/** Map from card ID to the domain element IDs it collects. */
+const CARD_TO_DOMAIN: Record<string, string[]> = {
+  NameCard: ["FullName"],
+  DateOfBirthCard: ["DateOfBirth"],
+  EmailCardPersonalEmail: ["PersonalEmail"],
+  PhoneCardMobilePhone: ["MobilePhone"],
+  AddressCard: ["CurrentAddress"],
+  DocumentCard: ["PrimaryDocument"],
+  ControlCard: [],
+};
+
+/** Look up a domain element definition. */
+export function getDomainElement(id: string): DomainElementDef | undefined {
+  return REGISTRY.get(id);
+}
+
+/** Resolve card IDs to domain element definitions. */
+export function resolveCardElements(cardIds: string[]): DomainElementDef[] {
+  const domainIds = cardIds.flatMap((id) => CARD_TO_DOMAIN[id] ?? []);
+  return domainIds
+    .map((id) => REGISTRY.get(id))
+    .filter((d): d is DomainElementDef => d !== undefined);
+}
+
+/** Resolve card IDs to domain element ID strings. */
+export function resolveDomainElementIds(cardIds: string[]): string[] {
+  return cardIds.flatMap((id) => CARD_TO_DOMAIN[id] ?? []);
+}
+```
+
+Each domain element definition has three key parts:
+
+1. **`fields`**: An array of `FieldDef` objects that describe the form inputs — their types, labels, placeholders, validation rules, and grid layout hints (for example, `colSpan: 1` renders the field at half-width in a two-column grid).
+
+2. **`requiredFields`**: The field IDs that must be filled when the domain element's `collects` spec is `"required"`. Fields marked `alwaysOptional: true` (like middle names) are excluded from this check.
+
+3. **`toSubject`**: A function that transforms flat form values into the nested structure the GBG API expects. For example, the `FullName` element splits comma-separated last names into an array: `"Doe, Smith"` becomes `["Doe", "Smith"]`.
+
+The `CARD_TO_DOMAIN` mapping at the bottom connects GBG card IDs (like `NameCard`) to domain element IDs (like `FullName`). When the API returns a page with a `NameCard`, the registry resolves it to the `FullName` element, which knows exactly which fields to render. To support a new domain element, you add an entry to the registry — no component changes needed.
+
+## Domain mapper
+
+Create `src/lib/domain-mapper.ts`. This module transforms the flat `FormValues` map into the structured `SubjectData` payload that the GBG API expects:
+
+```typescript typescript theme={null}
+// src/lib/domain-mapper.ts
+import type { FormValues, SubjectData } from "./types";
+import { getDomainElement, resolveDomainElementIds } from "./domain-elements";
+
+/**
+ * Builds the canonical `context.subject` payload from dynamic form values.
+ * Iterates over the collected domain elements and delegates to each
+ * element's `toSubject` mapper defined in the registry.
+ */
+export function buildSubjectPayload(
+  formValues: FormValues,
+  domainElementIds: string[],
+): SubjectData {
+  const subject: SubjectData = { identity: {} };
+
+  for (const id of domainElementIds) {
+    const def = getDomainElement(id);
+    if (!def) continue;
+
+    const partial = def.toSubject(formValues);
+    Object.assign(subject.identity, partial);
+  }
+
+  return subject;
+}
+
+/**
+ * Resolves which domain element IDs a list of card IDs collects.
+ */
+export function resolveDomainElements(cardIds: string[]): string[] {
+  return resolveDomainElementIds(cardIds);
+}
+```
+
+The `buildSubjectPayload` function iterates over all collected domain elements, calls each element's `toSubject` mapper, and merges the results into a single `identity` object. This means each domain element only knows about its own fields, but the final payload contains data from all elements across all pages.
+
+## Form validation
+
+Create `src/lib/validation.ts`. This module validates a single page of form values against the domain element definitions:
+
+```typescript typescript theme={null}
+// src/lib/validation.ts
+import type { FormValues, CollectsItem } from "./types";
+import { getDomainElement } from "./domain-elements";
+
+type Errors = Record<string, string>;
+
+/**
+ * Validates form values for the domain elements on a given page.
+ * Uses the field definitions from the registry — no hardcoded field checks.
+ * Returns an error map (field → message). Empty map = valid.
+ */
+export function validatePage(
+  formValues: FormValues,
+  domainElementIds: string[],
+  collects: CollectsItem[],
+): Errors {
+  const errors: Errors = {};
+  const specMap = new Map(collects.map((c) => [c.ref, c.spec]));
+
+  for (const elementId of domainElementIds) {
+    const def = getDomainElement(elementId);
+    if (!def) continue;
+
+    const isRequired = specMap.get(elementId) === "required";
+
+    for (const field of def.fields) {
+      const value = formValues[field.id] ?? "";
+
+      // Check required
+      if (
+        isRequired &&
+        !field.alwaysOptional &&
+        def.requiredFields.includes(field.id) &&
+        !value.trim()
+      ) {
+        errors[field.id] = `${field.label} is required.`;
+        continue;
+      }
+
+      // Run field-level validator
+      if (field.validate && value) {
+        const err = field.validate(value);
+        if (err) errors[field.id] = err;
+      }
+    }
+  }
+
+  return errors;
+}
+```
+
+Validation is driven entirely by the registry. For each domain element on the current page, the function checks whether empty required fields are missing and runs any custom `validate` function defined on the field (for example, the date-of-birth validator that rejects future dates). The `collects` array from the API response determines whether each element is required or optional.
+
+## DynamicField component
+
+Create `src/components/DynamicField.tsx`. This component renders a single form field based on its `FieldDef` type:
+
+```typescript typescript expandable theme={null}
+// src/components/DynamicField.tsx
+"use client";
+
+import { useRef } from "react";
+import { Upload, X } from "lucide-react";
+import type { FieldDef } from "@/lib/types";
+
+interface DynamicFieldProps {
+  field: FieldDef;
+  value: string;
+  error?: string;
+  required: boolean;
+  onChange: (value: string) => void;
+}
+
+export function DynamicField({
+  field,
+  value,
+  error,
+  required,
+  onChange,
+}: DynamicFieldProps) {
+  const errorClass = error ? "!border-red-400 !ring-red-500/20" : "";
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const labelSuffix = required ? (
+    <span className="text-red-500">*</span>
+  ) : (
+    <span className="ml-1 text-xs font-normal text-slate-400">optional</span>
+  );
+
+  // ── File input ────────────────────────────────────────────────────────────
+  if (field.type === "file") {
+    const hasFile = !!value;
+
+    const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+      const file = e.target.files?.[0];
+      if (!file) return;
+
+      const reader = new FileReader();
+      reader.onload = () => {
+        onChange(reader.result as string);
+      };
+      reader.readAsDataURL(file);
+    };
+
+    const handleClear = () => {
+      onChange("");
+      if (fileInputRef.current) fileInputRef.current.value = "";
+    };
+
+    return (
+      <div>
+        <label className="input-label">
+          {field.label} {labelSuffix}
+        </label>
+
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept={field.accept}
+          onChange={handleFileChange}
+          className="hidden"
+          id={field.id}
+        />
+
+        {hasFile ? (
+          <div className="flex items-center gap-3 rounded-lg border border-slate-200 bg-slate-50 px-4 py-3">
+            <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-gbg-100">
+              <Upload className="h-5 w-5 text-gbg-700" />
+            </div>
+            <div className="flex-1 min-w-0">
+              <p className="text-sm font-medium text-slate-700 truncate">
+                Document uploaded
+              </p>
+              <p className="text-xs text-slate-500">
+                Click the X to remove and re-upload
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={handleClear}
+              className="flex h-8 w-8 items-center justify-center rounded-full text-slate-400 hover:bg-slate-200 hover:text-slate-600 transition-colors"
+            >
+              <X className="h-4 w-4" />
+            </button>
+          </div>
+        ) : (
+          <button
+            type="button"
+            onClick={() => fileInputRef.current?.click()}
+            className={`
+              flex w-full items-center justify-center gap-2 rounded-lg border-2 border-dashed
+              px-4 py-8 text-sm transition-colors
+              ${error
+                ? "border-red-300 bg-red-50 text-red-600 hover:border-red-400"
+                : "border-slate-300 bg-slate-50 text-slate-500 hover:border-gbg-400 hover:bg-gbg-50 hover:text-gbg-700"
+              }
+            `}
+          >
+            <Upload className="h-5 w-5" />
+            Click to upload your document
+          </button>
+        )}
+
+        {error && <p className="input-error">{error}</p>}
+        {field.hint && (
+          <p className="mt-1 text-xs text-slate-400">{field.hint}</p>
+        )}
+      </div>
+    );
+  }
+
+  // ── Select input ──────────────────────────────────────────────────────────
+  if (field.type === "select") {
+    return (
+      <div>
+        <label htmlFor={field.id} className="input-label">
+          {field.label} {labelSuffix}
+        </label>
+        <select
+          id={field.id}
+          className={`input-field ${errorClass}`}
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          autoComplete={field.autoComplete}
+        >
+          <option value="">Select {field.label.toLowerCase()}</option>
+          {field.options?.map((opt) => (
+            <option key={opt.value} value={opt.value}>
+              {opt.label}
+            </option>
+          ))}
+        </select>
+        {error && <p className="input-error">{error}</p>}
+        {field.hint && (
+          <p className="mt-1 text-xs text-slate-400">{field.hint}</p>
+        )}
+      </div>
+    );
+  }
+
+  // ── Standard input (text, email, tel, date) ───────────────────────────────
+  return (
+    <div>
+      <label htmlFor={field.id} className="input-label">
+        {field.label} {labelSuffix}
+      </label>
+      <input
+        id={field.id}
+        type={field.type}
+        className={`input-field ${errorClass}`}
+        placeholder={field.placeholder}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        autoComplete={field.autoComplete}
+        {...(field.type === "date"
+          ? { max: new Date().toISOString().split("T")[0] }
+          : {})}
+      />
+      {error && <p className="input-error">{error}</p>}
+      {field.hint && (
+        <p className="mt-1 text-xs text-slate-400">{field.hint}</p>
+      )}
+    </div>
+  );
+}
+```
+
+`DynamicField` handles four distinct field types:
+
+* **File inputs**: Uses a hidden `<input type="file">` behind a styled upload button. When a file is selected, it reads the file as a base64 data URI using `FileReader` and stores the result as a string in `FormValues`. After upload, it shows a confirmation state with a clear button.
+* **Select inputs**: Renders a `<select>` dropdown populated from the `options` array defined in the field's `FieldDef`.
+* **Standard inputs**: Renders `<input>` elements for `text`, `email`, `tel`, and `date` types. Date fields automatically set `max` to today's date to prevent future dates.
+* **Labels and errors**: Every field shows a required indicator (`*`) or "optional" tag, and displays validation errors and hint text below the input.
+
+## CardRenderer component
+
+Create `src/components/CardRenderer.tsx`. This component takes a single card from the interaction response and renders the appropriate form fields:
+
+```typescript typescript expandable theme={null}
+// src/components/CardRenderer.tsx
+"use client";
+
+import type { InteractionCard, CollectsItem, FormValues } from "@/lib/types";
+import { resolveCardElements } from "@/lib/domain-elements";
+import { DynamicField } from "./DynamicField";
+
+interface CardRendererProps {
+  card: InteractionCard;
+  formValues: FormValues;
+  collects: CollectsItem[];
+  onChange: (fieldId: string, value: string) => void;
+  errors: Record<string, string>;
+}
+
+/**
+ * Dynamically renders form fields for a card based on the domain elements
+ * it maps to. No hardcoded card components — everything is driven by the
+ * domain element registry in domain-elements.ts.
+ */
+export function CardRenderer({
+  card,
+  formValues,
+  collects,
+  onChange,
+  errors,
+}: CardRendererProps) {
+  // ControlCard is navigation-only — skip it
+  if (card.id === "ControlCard") return null;
+
+  const elements = resolveCardElements([card.id]);
+
+  if (elements.length === 0) {
+    return (
+      <div className="rounded-lg border border-amber-200 bg-amber-50 p-4">
+        <p className="text-sm text-amber-800">
+          Unknown card type:{" "}
+          <code className="rounded bg-amber-100 px-1.5 py-0.5 font-mono text-xs">
+            {card.id}
+          </code>
+        </p>
+        <p className="mt-1 text-xs text-amber-600">
+          This card is not yet supported in this frontend.
+        </p>
+      </div>
+    );
+  }
+
+  // Build a spec lookup from collects
+  const specMap = new Map(collects.map((c) => [c.ref, c.spec]));
+
+  return (
+    <div className="space-y-6">
+      {elements.map((element) => {
+        const elementRequired = specMap.get(element.id) === "required";
+        const hasGridFields = element.fields.some(
+          (f) => f.colSpan === 1,
+        );
+
+        return (
+          <div key={element.id}>
+            {hasGridFields ? (
+              <div className="grid grid-cols-2 gap-4">
+                {element.fields.map((field) => {
+                  const isRequired =
+                    !field.alwaysOptional &&
+                    elementRequired &&
+                    element.requiredFields.includes(field.id);
+
+                  const wrapper =
+                    field.colSpan === 1 ? (
+                      <div key={field.id}>
+                        <DynamicField
+                          field={field}
+                          value={formValues[field.id] ?? ""}
+                          error={errors[field.id]}
+                          required={isRequired}
+                          onChange={(v) => onChange(field.id, v)}
+                        />
+                      </div>
+                    ) : (
+                      <div key={field.id} className="col-span-2">
+                        <DynamicField
+                          field={field}
+                          value={formValues[field.id] ?? ""}
+                          error={errors[field.id]}
+                          required={isRequired}
+                          onChange={(v) => onChange(field.id, v)}
+                        />
+                      </div>
+                    );
+
+                  return wrapper;
+                })}
+              </div>
+            ) : (
+              <div className="space-y-5">
+                {element.fields.map((field) => {
+                  const isRequired =
+                    !field.alwaysOptional &&
+                    elementRequired &&
+                    element.requiredFields.includes(field.id);
+
+                  return (
+                    <DynamicField
+                      key={field.id}
+                      field={field}
+                      value={formValues[field.id] ?? ""}
+                      error={errors[field.id]}
+                      required={isRequired}
+                      onChange={(v) => onChange(field.id, v)}
+                    />
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+```
+
+The `CardRenderer` is the bridge between the API response and the form UI. Here's its rendering logic:
+
+1. **Skip navigation cards**: `ControlCard` is a navigation-only card with no fields to collect, so it returns `null`.
+2. **Resolve elements**: It calls `resolveCardElements` with the card ID to look up the matching domain element definitions from the registry. If no match is found, it renders a warning banner — this makes it safe to add new card types in the Journey Builder before updating the frontend.
+3. **Determine layout**: If any field in the element has `colSpan: 1`, it uses a two-column CSS grid. Fields with `colSpan: 1` take half the width, while fields with `colSpan: 2` (or no `colSpan`) span the full width. This is how the address form renders City and County side by side.
+4. **Determine required state**: Each field's required state is computed from three sources — the `collects` spec from the API, the element's `requiredFields` list, and the field's `alwaysOptional` flag.
+
+## StepIndicator component
+
+Create `src/components/StepIndicator.tsx`. This component renders a progress bar showing which page the user is on:
+
+```typescript typescript theme={null}
+// src/components/StepIndicator.tsx
+"use client";
+
+import { Check } from "lucide-react";
+import type { InteractionPage } from "@/lib/types";
+
+interface StepIndicatorProps {
+  pages: InteractionPage[];
+  currentIndex: number;
+}
+
+export function StepIndicator({ pages, currentIndex }: StepIndicatorProps) {
+  return (
+    <nav aria-label="Verification steps" className="mb-10">
+      <ol className="flex items-center">
+        {pages.map((page, idx) => {
+          const isCompleted = idx < currentIndex;
+          const isCurrent = idx === currentIndex;
+
+          return (
+            <li
+              key={page.id}
+              className="flex items-center last:flex-none flex-1"
+            >
+              {/* Step circle */}
+              <div className="flex flex-col items-center">
+                <div
+                  className={`
+                    flex h-10 w-10 items-center justify-center rounded-full
+                    text-sm font-semibold transition-all duration-300
+                    ${
+                      isCompleted
+                        ? "bg-gbg-700 text-white shadow-md shadow-gbg-700/30"
+                        : isCurrent
+                          ? "bg-gbg-100 text-gbg-800 ring-2 ring-gbg-500 ring-offset-2"
+                          : "bg-slate-100 text-slate-400"
+                    }
+                  `}
+                >
+                  {isCompleted ? (
+                    <Check className="h-5 w-5" strokeWidth={3} />
+                  ) : (
+                    idx + 1
+                  )}
+                </div>
+                <span
+                  className={`
+                    mt-2 text-xs font-medium text-center max-w-[100px]
+                    ${isCurrent ? "text-gbg-800" : isCompleted ? "text-slate-600" : "text-slate-400"}
+                  `}
+                >
+                  {page.label}
+                </span>
+              </div>
+
+              {/* Connector line (not after last item) */}
+              {idx < pages.length - 1 && (
+                <div
+                  className={`
+                    mx-3 mt-[-1.5rem] h-0.5 flex-1 rounded-full transition-colors duration-300
+                    ${idx < currentIndex ? "bg-gbg-700" : "bg-slate-200"}
+                  `}
+                />
+              )}
+            </li>
+          );
+        })}
+      </ol>
+    </nav>
+  );
+}
+```
+
+The `StepIndicator` renders numbered circles connected by lines. It receives the `pages` array directly from the interaction response, so the number of steps automatically matches however many pages the journey has. Completed steps show a checkmark icon, the current step has a highlighted ring, and future steps are greyed out.
+
+## VerificationForm component
+
+Create `src/components/VerificationForm.tsx`. This is the main orchestrator that manages the entire verification workflow:
+
+```typescript typescript expandable theme={null}
+// src/components/VerificationForm.tsx
+"use client";
+
+import { useState, useCallback } from "react";
+import {
+  Shield,
+  Loader2,
+  CheckCircle2,
+  XCircle,
+  ArrowRight,
+  ArrowLeft,
+  RotateCcw,
+} from "lucide-react";
+import type { InteractionFetchResponse, FormValues } from "@/lib/types";
+import {
+  startJourney,
+  pollForInteraction,
+  submitInteraction,
+  fetchJourneyState,
+} from "@/lib/api";
+import { buildSubjectPayload, resolveDomainElements } from "@/lib/domain-mapper";
+import { validatePage } from "@/lib/validation";
+import { StepIndicator } from "./StepIndicator";
+import { CardRenderer } from "./CardRenderer";
+
+type Stage = "idle" | "starting" | "form" | "submitting" | "polling" | "result";
+
+interface Props {
+  resourceId: string;
+}
+
+export function VerificationForm({ resourceId }: Props) {
+  // ─── Journey state ───────────────────────────────────────────────────────
+  const [stage, setStage] = useState<Stage>("idle");
+  const [interaction, setInteraction] = useState<InteractionFetchResponse | null>(null);
+  const [instanceId, setInstanceId] = useState<string | null>(null);
+  const [journeyResult, setJourneyResult] = useState<{
+    status: string;
+    data?: Record<string, unknown>;
+  } | null>(null);
+
+  // ─── Form state (dynamic — keyed by field ID) ──────────────────────────
+  const [formValues, setFormValues] = useState<FormValues>({});
+  const [currentPageIndex, setCurrentPageIndex] = useState(0);
+  const [errors, setErrors] = useState<Record<string, string>>({});
+  const [globalError, setGlobalError] = useState<string | null>(null);
+
+  // Derived: current interaction pages
+  const pages = interaction?.interaction?.resource?.data?.pages ?? [];
+  const currentPage = pages[currentPageIndex];
+  const isLastPage = currentPageIndex === pages.length - 1;
+
+  // ─── Handlers ────────────────────────────────────────────────────────────
+
+  const handleFieldChange = useCallback((fieldId: string, value: string) => {
+    setFormValues((prev) => ({ ...prev, [fieldId]: value }));
+    setErrors((prev) => {
+      if (!prev[fieldId]) return prev;
+      const next = { ...prev };
+      delete next[fieldId];
+      return next;
+    });
+  }, []);
+
+  /** Step 1: Start the journey and poll for the first interaction. */
+  const handleStart = async () => {
+    setStage("starting");
+    setGlobalError(null);
+
+    try {
+      const startResponse = await startJourney(resourceId);
+
+      if (!startResponse?.instanceId) {
+        throw new Error("Failed to start journey — no instance ID returned.");
+      }
+
+      const newInstanceId = startResponse.instanceId;
+      setInstanceId(newInstanceId);
+
+      // Poll until the platform produces an interaction
+      const interactionData = await pollForInteraction(newInstanceId);
+
+      if (!interactionData?.interaction?.resource?.data?.pages?.length) {
+        throw new Error("No interaction pages returned. Please try again.");
+      }
+
+      setInteraction(interactionData);
+      setCurrentPageIndex(0);
+      setStage("form");
+    } catch (err) {
+      setGlobalError((err as Error).message);
+      setStage("idle");
+    }
+  };
+
+  /** Validate and advance to the next page, or submit on the last page. */
+  const handleNext = async () => {
+    if (!interaction || !currentPage || !instanceId) return;
+
+    // Resolve which domain elements this page's cards collect
+    const cardIds = currentPage.cards.map((c) => c.id);
+    const pageDomainElements = resolveDomainElements(cardIds);
+
+    // Validate
+    const pageErrors = validatePage(
+      formValues,
+      pageDomainElements,
+      interaction.interaction.collects,
+    );
+
+    if (Object.keys(pageErrors).length > 0) {
+      setErrors(pageErrors);
+      return;
+    }
+
+    if (!isLastPage) {
+      setCurrentPageIndex((prev) => prev + 1);
+      setErrors({});
+      return;
+    }
+
+    // ─── Last page: submit all collected data ──────────────────────────────
+    setStage("submitting");
+    setGlobalError(null);
+
+    try {
+      // Gather ALL domain elements collected across ALL pages
+      const allCardIds = pages.flatMap((p) => p.cards.map((c) => c.id));
+      const allDomainElements = resolveDomainElements(allCardIds);
+
+      // Build participants array from collected domain elements
+      const participants = allDomainElements.map((id) => ({
+        domainElementId: id,
+      }));
+
+      // Build the canonical context.subject payload
+      const subject = buildSubjectPayload(formValues, allDomainElements);
+
+      await submitInteraction({
+        instanceId,
+        interactionId: interaction.interactionId,
+        participants,
+        context: { subject },
+      });
+
+      // After submit, poll for journey state
+      setStage("polling");
+
+      const MAX_POLLS = 30;
+      const INTERVAL = 2000;
+
+      for (let i = 0; i < MAX_POLLS; i++) {
+        const state = await fetchJourneyState(instanceId);
+
+        if (state.status !== "InProgress") {
+          setJourneyResult({ status: state.status, data: state.data ?? undefined });
+          setStage("result");
+          return;
+        }
+
+        await new Promise((r) => setTimeout(r, INTERVAL));
+      }
+
+      // If we exhaust polls, show what we have
+      setJourneyResult({ status: "InProgress" });
+      setStage("result");
+    } catch (err) {
+      setGlobalError((err as Error).message);
+      setStage("form");
+    }
+  };
+
+  const handleBack = () => {
+    if (currentPageIndex > 0) {
+      setCurrentPageIndex((prev) => prev - 1);
+      setErrors({});
+    }
+  };
+
+  const handleReset = () => {
+    setStage("idle");
+    setInteraction(null);
+    setInstanceId(null);
+    setJourneyResult(null);
+    setFormValues({});
+    setCurrentPageIndex(0);
+    setErrors({});
+    setGlobalError(null);
+  };
+
+  // ─── Render ──────────────────────────────────────────────────────────────
+
+  return (
+    <div className="mx-auto w-full max-w-2xl">
+      {/* ── Header ──────────────────────────────────────────────────────── */}
+      <div className="mb-8 text-center">
+        <div className="mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-2xl bg-gbg-100">
+          <Shield className="h-7 w-7 text-gbg-700" />
+        </div>
+        <h1 className="font-display text-3xl font-bold tracking-tight text-slate-900">
+          Identity verification
+        </h1>
+        <p className="mt-2 text-sm text-slate-500">
+          Powered by GBG GO — secure, fast, and compliant.
+        </p>
+      </div>
+
+      {/* ── Error banner ────────────────────────────────────────────────── */}
+      {globalError && (
+        <div className="mb-6 rounded-lg border border-red-200 bg-red-50 px-4 py-3">
+          <div className="flex items-start gap-3">
+            <XCircle className="mt-0.5 h-5 w-5 shrink-0 text-red-500" />
+            <div>
+              <p className="text-sm font-medium text-red-800">
+                Something went wrong
+              </p>
+              <p className="mt-0.5 text-sm text-red-600">{globalError}</p>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Idle: Start button ──────────────────────────────────────────── */}
+      {stage === "idle" && (
+        <div className="rounded-2xl border border-slate-200 bg-white p-8 shadow-sm">
+          <div className="text-center">
+            <p className="mb-6 text-sm text-slate-600">
+              Click below to begin the identity verification journey. We will
+              walk you through a few short steps to collect and verify your
+              identity information.
+            </p>
+            <button onClick={handleStart} className="btn-primary">
+              Begin verification
+              <ArrowRight className="h-4 w-4" />
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* ── Starting: Loading ───────────────────────────────────────────── */}
+      {stage === "starting" && (
+        <div className="rounded-2xl border border-slate-200 bg-white p-12 shadow-sm">
+          <div className="flex flex-col items-center gap-4">
+            <Loader2 className="h-10 w-10 animate-spin text-gbg-600" />
+            <div className="text-center">
+              <p className="font-medium text-slate-700">
+                Starting your journey...
+              </p>
+              <p className="mt-1 text-sm text-slate-500">
+                Initialising the verification process.
+              </p>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Form: Multi-step interaction ────────────────────────────────── */}
+      {stage === "form" && interaction && currentPage && (
+        <div className="rounded-2xl border border-slate-200 bg-white p-8 shadow-sm">
+          <StepIndicator pages={pages} currentIndex={currentPageIndex} />
+
+          {/* Page title */}
+          <h2 className="mb-6 font-display text-xl font-semibold text-slate-900">
+            {currentPage.label}
+          </h2>
+
+          {/* Render cards for this page */}
+          <div className="space-y-6">
+            {currentPage.cards.map((card) => (
+              <CardRenderer
+                key={card.id}
+                card={card}
+                formValues={formValues}
+                collects={interaction.interaction.collects}
+                onChange={handleFieldChange}
+                errors={errors}
+              />
+            ))}
+          </div>
+
+          {/* Navigation */}
+          <div className="mt-8 flex items-center justify-between border-t border-slate-100 pt-6">
+            <button
+              onClick={handleBack}
+              disabled={currentPageIndex === 0}
+              className="btn-secondary disabled:invisible"
+            >
+              <ArrowLeft className="h-4 w-4" />
+              Back
+            </button>
+
+            <button onClick={handleNext} className="btn-primary">
+              {isLastPage ? "Submit" : "Continue"}
+              <ArrowRight className="h-4 w-4" />
+            </button>
+          </div>
+
+          {/* Outstanding elements indicator */}
+          {interaction.outstanding.length > 0 && (
+            <div className="mt-4 rounded-lg bg-slate-50 px-4 py-2.5">
+              <p className="text-xs text-slate-500">
+                <span className="font-medium">Still required:</span>{" "}
+                {interaction.outstanding.join(", ")}
+              </p>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ── Submitting ──────────────────────────────────────────────────── */}
+      {stage === "submitting" && (
+        <div className="rounded-2xl border border-slate-200 bg-white p-12 shadow-sm">
+          <div className="flex flex-col items-center gap-4">
+            <Loader2 className="h-10 w-10 animate-spin text-gbg-600" />
+            <div className="text-center">
+              <p className="font-medium text-slate-700">
+                Submitting your data...
+              </p>
+              <p className="mt-1 text-sm text-slate-500">
+                Sending your information for verification.
+              </p>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Polling for result ─────────────────────────────────────────── */}
+      {stage === "polling" && (
+        <div className="rounded-2xl border border-slate-200 bg-white p-12 shadow-sm">
+          <div className="flex flex-col items-center gap-4">
+            <Loader2 className="h-10 w-10 animate-spin text-gbg-600" />
+            <div className="text-center">
+              <p className="font-medium text-slate-700">
+                Verifying your identity...
+              </p>
+              <p className="mt-1 text-sm text-slate-500">
+                The platform is processing your data. This may take a moment.
+              </p>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Result ────────────────────────────────────────────────────── */}
+      {stage === "result" && journeyResult && (
+        <div className="rounded-2xl border border-slate-200 bg-white p-8 shadow-sm">
+          <div className="flex flex-col items-center text-center">
+            {journeyResult.status === "Completed" ? (
+              <>
+                <div className="mb-4 flex h-16 w-16 items-center justify-center rounded-full bg-emerald-100">
+                  <CheckCircle2 className="h-8 w-8 text-emerald-600" />
+                </div>
+                <h2 className="font-display text-2xl font-bold text-slate-900">
+                  Verification complete
+                </h2>
+                <p className="mt-2 text-sm text-slate-500">
+                  Your identity has been successfully verified.
+                </p>
+              </>
+            ) : journeyResult.status === "Failed" ? (
+              <>
+                <div className="mb-4 flex h-16 w-16 items-center justify-center rounded-full bg-red-100">
+                  <XCircle className="h-8 w-8 text-red-600" />
+                </div>
+                <h2 className="font-display text-2xl font-bold text-slate-900">
+                  Verification failed
+                </h2>
+                <p className="mt-2 text-sm text-slate-500">
+                  We were unable to verify your identity. Please try again or
+                  contact support.
+                </p>
+              </>
+            ) : (
+              <>
+                <div className="mb-4 flex h-16 w-16 items-center justify-center rounded-full bg-amber-100">
+                  <Loader2 className="h-8 w-8 text-amber-600" />
+                </div>
+                <h2 className="font-display text-2xl font-bold text-slate-900">
+                  Still processing
+                </h2>
+                <p className="mt-2 text-sm text-slate-500">
+                  The verification is still in progress. Check back shortly.
+                </p>
+              </>
+            )}
+
+            <button onClick={handleReset} className="btn-secondary mt-6">
+              <RotateCcw className="h-4 w-4" />
+              Start new verification
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+```
+
+The `VerificationForm` component manages the entire verification lifecycle as a state machine with six stages:
+
+| Stage | What happens |
+|---|---|
+| `idle` | Shows a "Begin verification" button. |
+| `starting` | Calls `startJourney`, then polls `fetchInteraction` until pages are ready. |
+| `form` | Renders the multi-page form with `StepIndicator` and `CardRenderer`. |
+| `submitting` | Gathers all form values across all pages, builds the API payload using `buildSubjectPayload`, and calls `submitInteraction`. |
+| `polling` | Polls `fetchJourneyState` every 2 seconds (up to 30 attempts) waiting for the journey to complete. |
+| `result` | Shows a success, failure, or "still processing" screen with a reset button. |
+
+The `handleNext` function does double duty: on intermediate pages it validates and advances to the next page, and on the last page it triggers the full submission flow. Validation is per-page — only the domain elements present on the current page are validated, so users see errors immediately rather than at the end.
+
+The `handleFieldChange` callback clears field-level errors as soon as the user starts typing, providing instant feedback.
+
+## Entry point page
+
+Finally, create `src/app/page.tsx` to render the `VerificationForm` with the journey resource ID from your environment variables:
+
+```typescript typescript theme={null}
+// src/app/page.tsx
+import { VerificationForm } from "@/components/VerificationForm";
+
+export default function Home() {
+  const resourceId =
+    process.env.GBG_JOURNEY_RESOURCE_ID ??
+    "your_resource_id@latest";
+
+  return (
+    <main className="flex min-h-screen flex-col items-center justify-center px-4 py-16">
+      <VerificationForm resourceId={resourceId} />
+
+      <footer className="mt-12 text-center">
+        <p className="text-xs text-slate-400">
+          &copy; {new Date().getFullYear()} Powered by{" "}
+          <a
+            href="https://www.gbgplc.com"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="font-medium text-slate-500 hover:text-gbg-700 transition-colors"
+          >
+            GBG
+          </a>
+          . All rights reserved.
+        </p>
+      </footer>
+    </main>
+  );
+}
+```
+
+This is a server component that reads the `GBG_JOURNEY_RESOURCE_ID` environment variable and passes it as a prop to the client-side `VerificationForm`.
+
+## Demo
+
+Run the development server:
+
+```bash BASH theme={null}
+npm run dev
+```
+
+Navigate to `localhost:3000`. You should see the application running:
+
+<Frame>
+    <img src="https://mintcdn.com/gbg-loqate-refactor-guide-2/oheW2HSPn-fq_-l5/images/doc-upload-2.png?fit=max&auto=format&n=oheW2HSPn-fq_-l5&q=85&s=0515f587d780262a9a4423d3ee4294a9" alt="Identity verification app start screen" width="936" height="313" data-path="images/doc-upload-2.png" />
+</Frame>
+
+To test the verification flow:
+
+1. Click **Begin verification**. The app starts the journey and loads the form pages.
+
+2. Fill in the identity information across each step. The form fields and pages are generated from your journey configuration — if you add or remove modules in the Journey Builder, the form updates automatically.
+
+<Frame>
+    <img src="https://mintcdn.com/gbg-loqate-refactor-guide-2/oheW2HSPn-fq_-l5/images/doc-upload-3.png?fit=max&auto=format&n=oheW2HSPn-fq_-l5&q=85&s=27637e82f68d366ebf55f9e313188911" alt="Form with uploaded document" width="936" height="927" data-path="images/doc-upload-3.png" />
+</Frame>
+
+3. Click **Submit** on the final page. The app submits the data and polls for the result.
+
+You should see the journey response in your terminal:
+
+<Frame>
+    <img src="https://mintcdn.com/gbg-loqate-refactor-guide-2/oheW2HSPn-fq_-l5/images/doc-upload-4.png?fit=max&auto=format&n=oheW2HSPn-fq_-l5&q=85&s=c16128f89ec06dcf0101307e4a8ad4cc" alt="Terminal response from journey" width="936" height="432" data-path="images/doc-upload-4.png" />
+</Frame>
+
+After verification completes, you should see the result screen:
+
+<Frame>
+    <img src="https://mintcdn.com/gbg-loqate-refactor-guide-2/oheW2HSPn-fq_-l5/images/doc-upload-5.png?fit=max&auto=format&n=oheW2HSPn-fq_-l5&q=85&s=ae032cccc56a87b1840c5cffeda90621" alt="Verification complete screen" width="936" height="220" data-path="images/doc-upload-5.png" />
+</Frame>
+
+You can now investigate the details of this session in the [Investigation portal](/docs/go-v2/platform/investigate/overview):
+
+<Frame>
+    <img src="https://mintcdn.com/gbg-loqate-refactor-guide-2/oheW2HSPn-fq_-l5/images/doc-upload-6.png?fit=max&auto=format&n=oheW2HSPn-fq_-l5&q=85&s=f72daee385780954a35c8304fe809395" alt="Investigation portal overview" width="936" height="520" data-path="images/doc-upload-6.png" />
+</Frame>
+
+The investigation portal provides a detailed view of the verification process, including outcomes from each module. The session ID at the top matches the `instanceId` generated during the journey.
+
+Click the **Processing** tab to see individual module outcomes:
+
+<Frame>
+    <img src="https://mintcdn.com/gbg-loqate-refactor-guide-2/oheW2HSPn-fq_-l5/images/doc-upload-7.png?fit=max&auto=format&n=oheW2HSPn-fq_-l5&q=85&s=25f7f1e418f86700a8418d3c9a7840dc" alt="Processing tab with module outcomes" width="936" height="666" data-path="images/doc-upload-7.png" />
+</Frame>
+
+Click **More Details** on any module to see the full verification results. To learn more about the details view, refer to [View details of a customer session](/docs/go-v2/platform/investigate/view-customer-details).
+
+## Additional resources
+
+* [API reference](/docs/go-v2/api-reference/overview)
+* [Developer integration guides](/docs/go-v2/developer-integration/overview)
